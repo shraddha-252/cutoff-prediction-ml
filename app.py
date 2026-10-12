@@ -1,64 +1,102 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
 
-# Load the trained model pipeline
+# --- 1. Train (or load) the model ---
+# Cached so this only runs once per app instance, not on every interaction.
+# Training directly from the CSV on startup avoids relying on .pkl files being
+# committed to the repo (and avoids sklearn-version pickle mismatches between
+# your local machine and the deployment environment).
 @st.cache_resource
-def load_model():
-    return joblib.load('model.pkl')
+def load_components():
+    df = pd.read_csv("Delivery_Logistics.csv")
 
-model = load_model()
+    X = df.drop(columns=[
+        'delivery_id',
+        'delivery_time_hours',
+        'expected_time_hours',
+        'delayed',
+        'delivery_status'  # would leak the target
+    ])
+    y = df['delayed']
 
-st.set_page_config(
-    page_title="University Admission Cut-off Predictor",
-    page_icon="🎓",
-    layout="centered"
-)
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
 
-st.title("🎓 University Admission Cut-off Predictor")
-st.write("Predict the estimated admission cut-off score based on historical data using our Tuned Random Forest Model.")
+    X_encoded = pd.get_dummies(X, drop_first=True)
+    X_train_columns = X_encoded.columns.tolist()
 
-# Input fields matching model schema
-university_options = [
-    'Banaras Hindu University', 'University of Delhi', 
-    'Guru Gobind Singh Indraprastha University', 
-    'Indian Council of Agricultural Research (ICAR)', 'University of Kashmir'
-]
-round_options = ['1', '2', '3', 'spot', 'none']
-category_options = ['UR', 'OBC-NCL', 'SC', 'ST', 'EWS', 'PwBD']
-seat_options = ['general', 'Paid Fee Course', 'Delhi region', 'Outside Delhi']
-basis_options = ['official', 'merit-list']
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_encoded, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+    )
 
-# Form Layout
-with st.form("prediction_form"):
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        university = st.selectbox("University", options=university_options)
-        year = st.number_input("Admission Year", min_value=2024, max_value=2030, value=2026, step=1)
-        round_val = st.selectbox("Admission Round", options=round_options)
-        
-    with col2:
-        category = st.selectbox("Reservation Category", options=category_options)
-        seat_type = st.selectbox("Seat Type", options=seat_options)
-        basis = st.selectbox("Admission Basis", options=basis_options)
-        
-    submit_button = st.form_submit_button(label="Predict Cut-off")
+    # KNN is distance-based, so scale features (delivery_cost and delivery_rating
+    # are on very different scales and would otherwise dominate the distance calc)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
 
-if submit_button:
-    # Create a DataFrame for model input matching feature schema
-    input_data = pd.DataFrame([{
-        'university': university,
-        'year': year,
-        'round': round_val,
-        'category': category,
-        'seat_type': seat_type,
-        'basis': basis
-    }])
-    
-    # Make prediction
-    prediction = model.predict(input_data)[0]
-    
-    st.success(f"### Estimated Cut-off Score: **{prediction:.2f}**")
-    st.info("Note: Cut-off scores are capped at the historical 95th percentile (approx. 3007) for variance stability.")
+    model = KNeighborsClassifier(n_neighbors=5)
+    model.fit(X_train_scaled, y_train)
+
+    return model, le, scaler, X_train_columns
+
+knn_model, le, scaler, X_train_columns = load_components()
+
+# --- 2. Define Prediction Function ---
+def predict_delayed(input_data, X_train_columns, le, scaler, model):
+    input_df = pd.DataFrame([input_data])
+    input_df_encoded = pd.get_dummies(input_df, drop_first=True)
+    input_df_final = input_df_encoded.reindex(columns=X_train_columns, fill_value=0)
+    input_scaled = scaler.transform(input_df_final)
+    prediction_numeric = model.predict(input_scaled)
+    prediction_label = le.inverse_transform(prediction_numeric)
+    return prediction_label[0]
+
+# --- 3. Streamlit UI ---
+st.title('KNN Delivery Delay Prediction App')
+st.write('Enter the details of the delivery to predict if it will be delayed.')
+
+distance_km = st.number_input('Distance (km)', min_value=0.1, max_value=300.0, value=150.0)
+package_weight_kg = st.number_input('Package Weight (kg)', min_value=0.1, max_value=50.0, value=25.0)
+delivery_rating = st.slider('Delivery Rating', min_value=1, max_value=5, value=4)
+delivery_cost = st.number_input('Delivery Cost', min_value=0.0, max_value=2000.0, value=800.0)
+
+# These match the exact category values present in Delivery_Logistics.csv
+delivery_partner_options = ['amazon logistics', 'blue dart', 'delhivery', 'dhl', 'ecom express', 'ekart', 'fedex', 'shadowfax', 'xpressbees']
+package_type_options = ['automobile parts', 'clothing', 'cosmetics', 'documents', 'electronics', 'fragile items', 'furniture', 'groceries', 'pharmacy']
+vehicle_type_options = ['bike', 'ev bike', 'ev van', 'scooter', 'truck', 'van']
+delivery_mode_options = ['express', 'same day', 'standard', 'two day']
+region_options = ['central', 'east', 'north', 'south', 'west']
+weather_condition_options = ['clear', 'cold', 'foggy', 'hot', 'rainy', 'stormy']
+
+delivery_partner = st.selectbox('Delivery Partner', options=delivery_partner_options)
+package_type = st.selectbox('Package Type', options=package_type_options)
+vehicle_type = st.selectbox('Vehicle Type', options=vehicle_type_options)
+delivery_mode = st.selectbox('Delivery Mode', options=delivery_mode_options)
+region = st.selectbox('Region', options=region_options)
+weather_condition = st.selectbox('Weather Condition', options=weather_condition_options)
+
+input_features = {
+    'distance_km': distance_km,
+    'package_weight_kg': package_weight_kg,
+    'delivery_rating': delivery_rating,
+    'delivery_cost': delivery_cost,
+    'delivery_partner': delivery_partner,
+    'package_type': package_type,
+    'vehicle_type': vehicle_type,
+    'delivery_mode': delivery_mode,
+    'region': region,
+    'weather_condition': weather_condition
+}
+
+if st.button('Predict Delay'):
+    prediction = predict_delayed(input_features, X_train_columns, le, scaler, knn_model)
+    if prediction == 'yes':
+        st.error('Prediction: The delivery is likely to be **Delayed**')
+    else:
+        st.success('Prediction: The delivery is likely to be **On Time**')
+
+# To run: place Delivery_Logistics.csv in the same folder as this file, then
+# `streamlit run app.py`. No .pkl files needed — the model trains on startup.
